@@ -1,0 +1,152 @@
+
+### Author: Tiffany Wan, Andrew Valesano
+### Purpose: Get consensus genomes from Illumina sequencing data
+
+# ============================= How to run this pipeline ==========================
+
+# 1. Modify the parameters below as needed ("rule parameters").
+# 2. Load modules: module load Bioinformatics ivar python2.7-anaconda/2019.03 samtools/1.9 fastqc picard-tools bwa bedtools2 R
+# 3. Copy fastq files to data/fastq.
+# 4. Rename raw fastq files: Rscript "renamefile0608.R" "old filepath" "new filepath/"
+# 5. Unzip fastq files: gunzip -v data/fastq_renamed/*.gz
+# 6. Activate snakemake: conda activate snakemake
+# 7. Run job on Slurm: sbatch submit_snakemake.sbat -- Or run directly: snakemake -s snakefile -p --latency-wait 30 --cores 2
+
+# ============================= Configure run options here =============================
+
+IDS, = glob_wildcards("data/fastq_renamed/{id}.1.fastq") # Where the pipeline will grab all of the IDs to run. Important to have changed the filenames first.
+
+rule all:
+    input:
+        "data/H1N1_ivar_output/all.consensus.fasta",
+        "data/H1N1_ivar_output/coverage.csv"
+
+rule parameters:
+    params:
+        reference_fasta = "references/bwa_ref/H1N1_Hawaii_ref_ORF.fas", # fasta used for alignment
+        reference_index = "references/bwa_ref/H1N1_Hawaii_ref_ORF.fas", # bwa index used for alignment. Should be a build of reference_fasta
+        min_length = 13000, # minimum length of consensus genomes in final fasta file
+        name = "run", # Goes into the coverage.csv output file for tracking
+        min_qual_score = 0, # minimum quality score used in iVar consensus. Important that this is zero for calling indels.
+        consensus_threshold = 0, # frequency threshold value used in iVar consensus. See documentation.
+        min_depth = 10, # minimum depth used in iVar consensus
+        bowtie_option = "--very-sensitive-local", # bowtie2 mapping option
+
+setup = rules.parameters.params
+
+rule cutadapt:
+  input:
+    reads_1_in= "data/fastq_renamed/{id}.1.fastq",
+    reads_2_in= "data/fastq_renamed/{id}.2.fastq"
+
+  output:
+    reads_1_out= "data/H1N1_aligned_output/cutadapt/{id}.1.fastq",
+    reads_2_out= "data/H1N1_aligned_output/cutadapt/{id}.2.fastq"
+
+  shell:
+    "cutadapt -a CTGTCTCTTATACACATCT "
+    "-A CTGTCTCTTATACACATCT -o {output.reads_1_out} "
+    "-p {output.reads_2_out} {input.reads_1_in} {input.reads_2_in}"
+
+rule fastqc:
+        message:
+            """
+            =======================================================
+            Run FastQC
+            =======================================================
+            """
+        input:
+            reads_1_in = "data/H1N1_aligned_output/cutadapt/{id}.1.fastq",
+            reads_2_in = "data/H1N1_aligned_output/cutadapt/{id}.2.fastq"
+        output:
+            "data/H1N1_aligned_output/fastqc/{id}.1_fastqc.zip",
+            "data/H1N1_aligned_output/fastqc/{id}.2_fastqc.zip"
+        run:
+            shell("fastqc -o data/H1N1_aligned_output/fastqc --noextract -f fastq {input.reads_1_in}")
+            shell("fastqc -o data/H1N1_aligned_output/fastqc --noextract -f fastq {input.reads_2_in}")
+
+rule bwa_align:
+        message:
+            """
+            =======================================================
+            Map with BWA and sort
+            =======================================================
+            """
+        input:
+            reads_1_in = "data/H1N1_aligned_output/cutadapt/{id}.1.fastq",
+            reads_2_in = "data/H1N1_aligned_output/cutadapt/{id}.2.fastq"
+        output:
+            bam = "data/H1N1_aligned_output/align/{id}.sorted.bam"
+        shell:
+            "bwa mem {setup.reference_index} {input.reads_1_in} {input.reads_2_in} | samtools view -F 4 -Sb | samtools sort -o {output.bam} && samtools index {output.bam}"
+
+rule sort_bam:
+    message:
+        """
+        =======================================================
+        Sort the primer-trimmed file
+        =======================================================
+        """
+    input:
+        "data/H1N1_aligned_output/align/{id}.sorted.bam"
+    output:
+        bam = "data/H1N1_aligned_output/primertrim_sorted/{id}.removed.primertrim.sorted.bam",
+        bai = "data/H1N1_aligned_output/primertrim_sorted/{id}.removed.primertrim.sorted.bai"
+    shell:
+        "PicardCommandLine SortSam SO=coordinate INPUT={input} OUTPUT={output.bam} VALIDATION_STRINGENCY=LENIENT CREATE_INDEX=true"
+        #"samtools sort {input} -o {output}" # Old version
+
+rule get_coverage:
+    message:
+        """
+        =======================================================
+        Get coverage with samtools
+        =======================================================
+        """
+    input:
+        "data/H1N1_aligned_output/primertrim_sorted/{id}.removed.primertrim.sorted.bam"
+    output:
+        "data/H1N1_ivar_output/coverage/{id}.coverage.csv"
+    shell:
+        "samtools depth -a -d 100000 {input} > {output}"
+
+rule get_consensus:
+    message:
+        """
+        =======================================================
+        Get the consensus sequence with iVar
+        =======================================================
+        """
+    input:
+        bam_file = "data/H1N1_aligned_output/primertrim_sorted/{id}.removed.primertrim.sorted.bam"
+    output:
+        consensus_file = "data/H1N1_ivar_output/consensus/{id}.consensus.fa"
+    shell:
+        "samtools mpileup -a -A -d 100000 -Q 0 --reference {setup.reference_fasta} {input.bam_file} | ivar consensus -p {output.consensus_file} -n N -q {setup.min_qual_score} -t {setup.consensus_threshold} -m {setup.min_depth}"
+
+rule combine_and_export:
+    message:
+        """
+        =======================================================
+        Combine into a single fasta and coverage file
+        =======================================================
+        """
+    input:
+        coverage_files = expand("data/H1N1_ivar_output/coverage/{id}.coverage.csv", id = IDS),
+        consensus_files = expand("data/H1N1_ivar_output/consensus/{id}.consensus.fa", id = IDS),
+        fastqc_1 = expand("data/H1N1_aligned_output/fastqc/{id}.1_fastqc.zip", id = IDS),
+        fastqc_2 = expand("data/H1N1_aligned_output/fastqc/{id}.2_fastqc.zip", id = IDS)
+    output:
+        "data/H1N1_ivar_output/all.consensus.fasta",
+        "data/H1N1_ivar_output/coverage.csv"
+    shell:
+        "python ivar_CombinedAndExport_h1n1.py --run-info {setup.name} --min-length {setup.min_length}"
+
+
+rule clean:
+    message: "Removing directories: {params}"
+    params:
+        "data/H1N1_aligned_output ",
+        "data/H1N1_ivar_output"
+    shell:
+        "rm -rfv {params}"
